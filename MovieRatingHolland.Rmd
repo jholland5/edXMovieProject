@@ -1,0 +1,264 @@
+---
+title: "Movie Ratings Project"
+author: "Jason Holland"
+date: "5/9/2020"
+output: pdf_document
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This project utilizes a data set of approximately 10 million movie ratings.  The full data set is available at <https://grouplens.org>. The goal of the project is to develop a model to predict movie ratings using the available data.  The full code for getting the data is omitted from this report but is available in the file MovieRatingHolland.Rmd. The steps involved in obtaining our predictions include splitting the data into training and test sets, modeling user and movie effects using the training set, adding in a parameter to help control the variability of the effects using the training set, and computing the final *Root Mean Squared Error* (RMSE) for the test set (validation set). Before doing so, we look at some summaries of the data.
+
+
+```{r, include = FALSE}
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+library(ggplot2)
+library(gridExtra)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+
+
+In the plot below, we look at the number of ratings given for each 
+rating value.  Note that the values start at the lowest rating of .5 and end at the highest rating of 5. Note also that ratings of .5, 1.5, 2.5, 3.5 and 4.5 are less likely than integer valued ratings.
+
+
+```{r,echo = FALSE}
+zees <- edx$rating
+y <- table(zees)
+barplot(y, main = "Rating Counts in the Data Set",
+        col = "hotpink")
+```
+
+
+It is interesting to see the top six movies by number of ratings.  Pulp Fiction (1994) heads the list with over 31,000 ratings.
+
+
+```{r,echo=FALSE}
+edx %>% group_by(movieId, title) %>%
+  summarize(count = n()) %>%             
+  arrange(desc(count)) %>% head()
+```
+
+
+## Methodology
+
+The data is first divided into a training set called edx and a validation set.  The training set will be used to build our model and in the end the RMSE will be calculated using the validation set.  Our method will be to divide the edx set into two sets: edx_train and edx_test.  To do this we use the caret package to partition the sets. The code is not shown here but is included in the file MovieRatingHolland.Rmd.   Care must be taken to ensure that movie ID's and user ID's are in both sets so we use appropriate joins to accomplish this.  We gain insight by looking at histograms of two predictor variables.  The first plot we look at involves the effects of the *movieId* variable.
+
+
+```{r,echo=FALSE}
+edx_index <- createDataPartition(edx$rating,times = 1,p=.5,list = FALSE)
+edx_test <- edx %>% slice(edx_index)
+edx_train <- edx %>% slice(-edx_index)
+
+# We remove entries in the test set that do not have userId's or movieId's
+# in the training set.
+
+edx_test <- edx_test %>% semi_join(edx_train, by = "movieId") %>%
+  semi_join(edx_train,by = "userId")
+```
+
+
+```{r,echo=FALSE}
+mu <- mean(edx_train$rating)
+movie_avgs <- edx_train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))  
+# This is the average rating minus mu, it is the 
+# least squares estimate of b_i.
+# A quick plot reveals the distribution of the b_i's
+movie_avgs %>% qplot(b_i, geom ="histogram", 
+                     bins = 10, data = ., color = I("black"),
+                     main = "Movie Effects")
+```
+
+
+We see that there is a good bit of variability in the effects of the *movieId* variable.  Given that $\mu$ is about 3.5, we see that if $b_i$ (the added effect of movie *i*) approaches its maximum value, then $\mu + b_i$ would approach a perfect rating of 5. In the next plot, we look at the user effects (denoted by $b_u$) by examining the distribution of ratings grouped by the variable *userId*.  We see that there is quite a bit of variability in the following plot also.
+
+
+```{r,echo=FALSE}
+user_avgs <- edx_train %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating))  
+# This is the average rating grouped by userId.
+# Plot the distribution of the b_u's
+user_avgs %>% qplot(b_u, geom ="histogram", 
+                     bins = 10, data = ., color = I("black"),
+                     main ="Ratings by UserId")
+
+```
+
+
+Given the variability of $b_i$ for and $b_u$, our approach will be a model of the type
+
+$$Y_{u,i}=\mu+b_i+b_u+\epsilon_{u,i}.$$
+
+We will do this in four steps:  
+1. Examine the RMSS with $\mu$.  
+2. Examine the RMSS with $\mu$ plus movie effects.  
+3. Compute a third model and examine the RMSS using movie effects, user effects, and a parameter $\lambda$ to account for variability of the effects.  
+4. Compute the final RMSS value using the validation data set.
+
+
+## Results
+
+In this section we show the RMSE's for our three models and then show the final RMSE calculation using the validation set.  We only show the code for the last model for ease of reading.  The code for each model is available in the file MovieRatingHolland.Rmd. 
+
+
+### Model 1; Predicting the mean.
+
+In Model 1, we predict that the rating will just be the mean of all ratings.  The mean of all ratings is approximately $\mu = 3.5$.  This results in the following RMSE.
+
+
+```{r echo=FALSE}
+mu <- mean(edx_train$rating)
+
+# Compute RMSE using mu as the guess for every movie.
+
+naive_RMSE <- sqrt(mean((edx_test$rating - mu)^2))   
+paste("The RMSE for model 1 is ",round(naive_RMSE,5),".")
+
+```
+
+
+### Model 2; Predicting with the Mean and Movie Effects.
+
+In Model 2, we include a correction for the effects of the *movieId* variable.  The more movie ratings a particular movie gets, the higher the rating in general.
+
+
+```{r echo=FALSE}
+movie_avgs <- edx_train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu)) 
+predicted_ratings <- mu + edx_test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  .$b_i
+
+### RMSE for model with movie effects:
+model2_RMSE <- sqrt(mean((edx_test$rating - predicted_ratings)^2))
+paste("The RMSE for model 2 is ",round(model2_RMSE,5),".")
+```
+
+
+### Model 3; Mean, Movie Effects, User Effects, and Correction
+
+
+Before showing the code and results of the final model, we calculate a tuning parameter $\lambda$ which corrects for the variability of the effects.  We follow closely the techniques covered in section 33.9.2 of <https://rafalab.github.io/dsbook>.  We see in the following plot that the value of $\lambda$ that minimizes RMSE is around 4.5.
+
+
+```{r echo=FALSE}
+lambdas <- seq(0,7,.25)  # We find the best lambda between 0 an 7.
+
+RMSEs <- sapply(lambdas, function(l){
+  mu <- mean(edx_train$rating)
+# The b_i's are needed for movie effects.  
+  b_i <- edx_train %>% group_by(movieId) %>%
+    summarize(b_i = sum(rating-mu)/(n()+l))
+# The b_u's are needed for user effects. 
+  b_u <- edx_train %>% left_join(b_i, by="movieId") %>%
+    group_by(userId) %>% 
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- edx_test %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    pull(pred)
+  
+  return(sqrt(mean((edx_test$rating - predicted_ratings)^2)))
+})
+qplot(lambdas,RMSEs)
+
+```
+
+
+We compute the minimum $\lambda$ and obtain
+
+```{r echo=FALSE}
+lambda <- lambdas[which.min(RMSEs)]
+paste("The minimum value is",lambda,".")
+paste("The RMSE for this lambda is",round(RMSEs[which.min(RMSEs)],4),".")
+```
+
+
+Armed with this value for $\lambda$, we compute the final model using the entire test set, then check the RMSE on the validation set.  The code is given for this process.
+
+
+```{r echo=TRUE}
+mu <- mean(edx$rating)  # We use the full edx set for mu.
+# The b_i's are needed for movie effects.  
+b_i <- edx %>% group_by(movieId) %>% # full edx for b_i
+  summarize(b_i = sum(rating-mu)/(n()+4.75))
+# The b_u's are needed for user effects. Full edx for b_u
+b_u <- edx %>% left_join(b_i, by="movieId") %>%
+  group_by(userId) %>% 
+  summarize(b_u = sum(rating - b_i - mu)/(n()+4.75))
+
+predicted_ratings <- validation %>%   #Compute predictions and add
+  left_join(b_i, by = "movieId") %>%  # to validation set.
+  left_join(b_u, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+FINAL_RMSE <- (sqrt(mean((validation$rating - predicted_ratings)^2)))
+paste("The validation RMSE is",round(FINAL_RMSE,4))
+```
+
+
+## Conclusion
+
+We summarize the results of our models in a data frame reporting RMSE.  We use the name *Model1* for the *mean only* model.  We use *Model2* for the *mean plus movie effects* model. We will denote the third model with RMSE calculated on the training data by *Model3*.  Finally, we use *ModelF* to denote the model that we retuned using the whole training set, and then checked on the validation set.
+
+
+```{r echo=FALSE}
+RMSE3 <- round(RMSEs[which.min(RMSEs)],4)
+results <- data.frame(Model = c("Model1","Model2","Model3","ModelF"),
+                      RMSE = c(naive_RMSE,model2_RMSE,RMSE3,FINAL_RMSE))
+as_tibble(results)
+```
+
+
+This model is limited by only using two predictors variables.  Future improvements could include incorporating the genre, the year of release, and the year of the rating.  One could also use matrix factorization to hopefully achieve more accurate results.
